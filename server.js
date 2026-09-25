@@ -521,7 +521,10 @@ h2{font-family:'Playfair Display',serif;font-size:20px;font-weight:400;margin-bo
     </div>
     <div class="field">
       <label>Password *</label>
-      <input type="password" name="password" placeholder="Your password" required>
+      <div style="position:relative">
+        <input type="password" name="password" id="loginPw" placeholder="Your password" required style="padding-right:46px">
+        <button type="button" onclick="togglePw('loginPw',this)" aria-label="Show password" style="position:absolute;right:8px;top:0;height:44px;background:none;border:none;cursor:pointer;font-size:17px;color:#5C4B56">👁</button>
+      </div>
     </div>
     <button type="submit" class="btn">Sign In →</button>
   </form>
@@ -530,6 +533,9 @@ h2{font-family:'Playfair Display',serif;font-size:20px;font-weight:400;margin-bo
     Don't have an account? <a href="/register">Register here</a>
   </div>
 </div>
+<script>
+function togglePw(id,btn){var i=document.getElementById(id);if(i.type==='password'){i.type='text';btn.textContent='🙈';}else{i.type='password';btn.textContent='👁';}}
+</script>
 </body>
 </html>`;
 }
@@ -590,7 +596,10 @@ h2{font-family:'Playfair Display',serif;font-size:20px;font-weight:400;margin-bo
     </div>
     <div class="field">
       <label>Password *</label>
-      <input type="password" name="password" placeholder="Minimum 5 characters" required>
+      <div style="position:relative">
+        <input type="password" name="password" id="regPw" placeholder="Minimum 5 characters" required style="padding-right:46px">
+        <button type="button" onclick="togglePw('regPw',this)" aria-label="Show password" style="position:absolute;right:8px;top:0;height:44px;background:none;border:none;cursor:pointer;font-size:17px;color:#5C4B56">👁</button>
+      </div>
     </div>
     <div class="field">
       <label>WhatsApp Number</label>
@@ -613,6 +622,9 @@ h2{font-family:'Playfair Display',serif;font-size:20px;font-weight:400;margin-bo
   </form>
   <p class="signin-link">Already have an account? <a href="/login">Sign in</a></p>
 </div>
+<script>
+function togglePw(id,btn){var i=document.getElementById(id);if(i.type==='password'){i.type='text';btn.textContent='🙈';}else{i.type='password';btn.textContent='👁';}}
+</script>
 </body>
 </html>`;
 }
