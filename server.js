@@ -10,6 +10,7 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const TOKEN_FILE = path.join(__dirname, '.access_token');
+const SECRET = process.env.SESSION_SECRET || 'cosmo_secret_change_me';
 
 // ── LOAD SAVED TOKEN ──
 let savedAccessToken = process.env.SHOPIFY_ACCESS_TOKEN || '';
@@ -22,11 +23,54 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static('public'));
 app.use(session({
-  secret: process.env.SESSION_SECRET || 'cosmo_secret',
+  secret: SECRET,
   resave: false,
   saveUninitialized: false,
   cookie: { secure: false, maxAge: 24 * 60 * 60 * 1000 }
 }));
+
+// ════════════════════════════════════════
+//  PASSWORD HASHING (built-in crypto — no extra package)
+// ════════════════════════════════════════
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+  return salt + ':' + hash;
+}
+function verifyPassword(password, stored) {
+  try {
+    const [salt, hash] = stored.split(':');
+    const check = crypto.scryptSync(password, salt, 64).toString('hex');
+    return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(check, 'hex'));
+  } catch (e) {
+    return false;
+  }
+}
+
+// ════════════════════════════════════════
+//  LOGIN TOKEN (signed, stateless — used by the store gate)
+// ════════════════════════════════════════
+function makeToken(email) {
+  const payload = Buffer.from(JSON.stringify({
+    email: email,
+    exp: Date.now() + 30 * 24 * 60 * 60 * 1000  // 30 days
+  })).toString('base64url');
+  const sig = crypto.createHmac('sha256', SECRET).update(payload).digest('base64url');
+  return payload + '.' + sig;
+}
+function checkToken(token) {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 2) return null;
+    const expected = crypto.createHmac('sha256', SECRET).update(parts[0]).digest('base64url');
+    if (parts[1] !== expected) return null;
+    const data = JSON.parse(Buffer.from(parts[0], 'base64url').toString());
+    if (Date.now() > data.exp) return null;
+    return data;
+  } catch (e) {
+    return null;
+  }
+}
 
 // ════════════════════════════════════════
 //  OAUTH INSTALLATION ROUTES
@@ -96,7 +140,6 @@ function getShopifyAPI() {
     }
   });
 }
-// backward-compat alias
 const shopifyAPI = {
   get: (...a) => getShopifyAPI().get(...a),
   post: (...a) => getShopifyAPI().post(...a),
@@ -104,15 +147,22 @@ const shopifyAPI = {
   delete: (...a) => getShopifyAPI().delete(...a)
 };
 
-// ── EMAIL HELPER ──
+// ── EMAIL HELPER (non-blocking — call without await) ──
 async function sendEmail(to, subject, html) {
-  if (!process.env.GMAIL_USER || !process.env.GMAIL_PASS) return;
+  if (!process.env.GMAIL_USER || !process.env.GMAIL_PASS) {
+    console.log('Email skipped (GMAIL_USER/GMAIL_PASS not set)');
+    return;
+  }
   try {
     const transporter = nodemailer.createTransport({
       service: 'gmail',
       auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_PASS }
     });
-    await transporter.sendMail({ from: process.env.GMAIL_USER, to, subject, html });
+    await transporter.sendMail({
+      from: `"Cosmo Salon" <${process.env.GMAIL_USER}>`,
+      to, subject, html
+    });
+    console.log('Email sent to', to);
   } catch (e) {
     console.log('Email error:', e.message);
   }
@@ -125,11 +175,17 @@ function requireAdmin(req, res, next) {
 }
 
 // ════════════════════════════════════════
-//  CUSTOMER ROUTES
+//  STORE GATE — token verify (called by theme.liquid)
 // ════════════════════════════════════════
+app.get('/verify', (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  const token = req.query.token;
+  const data = token ? checkToken(token) : null;
+  res.json({ ok: !!data });
+});
 
 // ════════════════════════════════════════
-//  CUSTOMER LOGIN ROUTES
+//  CUSTOMER LOGIN ROUTES  (email + password)
 // ════════════════════════════════════════
 
 // GET /login — Customer Login Form
@@ -137,13 +193,12 @@ app.get('/login', (req, res) => {
   res.send(loginPage());
 });
 
-// POST /login — Check approved tag then redirect to Shopify
+// POST /login — Verify email + password + approved, then let into store
 app.post('/login', async (req, res) => {
-  const { email } = req.body;
-  if (!email) return res.send(loginPage('Please enter your email address.'));
+  const { email, password } = req.body;
+  if (!email || !password) return res.send(loginPage('Please enter your email and password.', email));
 
   try {
-    // Search customer by email in Shopify
     const response = await shopifyAPI.get('/customers/search.json', {
       params: { query: `email:${email}`, limit: 1 }
     });
@@ -156,19 +211,32 @@ app.post('/login', async (req, res) => {
     const customer = customers[0];
     const tags = (customer.tags || '').split(',').map(t => t.trim());
 
-    if (tags.includes('pending_approval')) {
-      return res.send(loginPage('⏳ Your account is pending admin approval. You will receive an email once approved.', email));
-    }
-
+    // Not approved yet?
     if (!tags.includes('approved')) {
+      if (tags.includes('rejected')) {
+        return res.send(loginPage('Your account request was declined. Please contact Cosmo Salon for details.', email));
+      }
+      if (tags.includes('pending_approval')) {
+        return res.send(loginPage('⏳ Your account is pending admin approval. You will receive an email once approved.', email));
+      }
       return res.send(loginPage('Your account is not approved yet. Please contact Cosmo Salon.', email));
     }
 
-    // Customer is approved! Redirect to Shopify login
-    res.redirect(`https://${process.env.SHOPIFY_STORE_DOMAIN}/account/login`);
+    // Verify password (hash stored in customer note)
+    const note = customer.note || '';
+    const pwdMatch = note.match(/PWD:\s*([^\s|]+)/);
+    if (!pwdMatch || !verifyPassword(password, pwdMatch[1])) {
+      return res.send(loginPage('Wrong password. Please try again.', email));
+    }
+
+    // Success! Make a login token and send them into the store
+    const token = makeToken(email);
+    const store = process.env.SHOPIFY_STORE_DOMAIN;
+    return res.redirect(`https://${store}/?cosmo_token=${encodeURIComponent(token)}`);
 
   } catch (err) {
-    res.send(loginPage('Something went wrong. Please try again.', email));
+    console.log('Login error:', err.message);
+    return res.send(loginPage('Something went wrong. Please try again.', email));
   }
 });
 
@@ -184,27 +252,29 @@ app.post('/register', async (req, res) => {
   if (!first_name || !email || !password || !branch) {
     return res.send(registerPage('Please fill all required fields.'));
   }
+  if (password.length < 5) {
+    return res.send(registerPage('Password must be at least 5 characters.'));
+  }
 
   try {
-    // Create customer in Shopify with "pending_approval" tag
+    const pwdHash = hashPassword(password);
+
     const response = await shopifyAPI.post('/customers.json', {
       customer: {
         first_name: first_name,
         last_name: '.',
         email: email,
         phone: phone || '',
-        password: password,
-        password_confirmation: password,
         tags: 'pending_approval',
-        note: `WhatsApp: ${whatsapp || 'Not provided'} | Branch: ${branch} | Status: pending_approval`,
+        note: `WhatsApp: ${whatsapp || 'Not provided'} | Branch: ${branch} | Status: pending_approval | PWD: ${pwdHash}`,
         send_email_welcome: false
       }
     });
 
     const customer = response.data.customer;
 
-    // Notify admin
-    await sendEmail(
+    // Notify admin (non-blocking — do NOT await, keeps page fast)
+    sendEmail(
       process.env.ADMIN_EMAIL,
       `🆕 New Registration — ${first_name} (${branch})`,
       `
@@ -229,7 +299,6 @@ app.post('/register', async (req, res) => {
     let msg = 'Something went wrong. Please try again.';
     if (errors?.email) msg = 'This email is already registered. Please sign in.';
     else if (errors?.phone) msg = 'Invalid phone number format.';
-    else if (errors?.password) msg = 'Password must be at least 5 characters.';
     return res.send(registerPage(msg));
   }
 });
@@ -278,32 +347,30 @@ app.get('/admin', requireAdmin, async (req, res) => {
 app.post('/admin/approve/:id', requireAdmin, async (req, res) => {
   const id = req.params.id;
   try {
-    // Get current customer
     const getRes = await shopifyAPI.get(`/customers/${id}.json`);
     const customer = getRes.data.customer;
 
-    // Replace pending_approval tag with approved
-    const currentTags = (customer.tags || '').split(',').map(t => t.trim()).filter(t => t && t !== 'pending_approval');
+    const currentTags = (customer.tags || '').split(',').map(t => t.trim()).filter(t => t && t !== 'pending_approval' && t !== 'rejected');
     currentTags.push('approved');
 
     await shopifyAPI.put(`/customers/${id}.json`, {
       customer: {
         id: id,
         tags: currentTags.join(', '),
-        note: (customer.note || '').replace('pending_approval', 'approved')
+        note: (customer.note || '').replace('Status: pending_approval', 'Status: approved')
       }
     });
 
-    // Email customer
-    await sendEmail(
+    // Email customer (non-blocking)
+    sendEmail(
       customer.email,
       '✅ Your Cosmo Salon account is approved!',
       `
         <h2>Welcome to Cosmo Salon Store!</h2>
         <p>Dear ${customer.first_name},</p>
-        <p>Your account has been approved. You can now sign in and place orders.</p>
+        <p>Your account has been approved. You can now sign in with your email and password and place orders.</p>
         <br>
-        <a href="https://${process.env.SHOPIFY_STORE_DOMAIN}/account/login"
+        <a href="${process.env.APP_URL}/login"
            style="background:#1C0B1A;color:white;padding:12px 24px;text-decoration:none;border-radius:6px;">
           Sign In Now
         </a>
@@ -318,16 +385,25 @@ app.post('/admin/approve/:id', requireAdmin, async (req, res) => {
   }
 });
 
-// POST /admin/reject/:id — Reject & delete customer
+// POST /admin/reject/:id — Reject customer (keeps record, tags as rejected)
 app.post('/admin/reject/:id', requireAdmin, async (req, res) => {
   const id = req.params.id;
   try {
     const getRes = await shopifyAPI.get(`/customers/${id}.json`);
     const customer = getRes.data.customer;
 
-    await shopifyAPI.delete(`/customers/${id}.json`);
+    const currentTags = (customer.tags || '').split(',').map(t => t.trim()).filter(t => t && t !== 'pending_approval' && t !== 'approved');
+    currentTags.push('rejected');
 
-    await sendEmail(
+    await shopifyAPI.put(`/customers/${id}.json`, {
+      customer: {
+        id: id,
+        tags: currentTags.join(', '),
+        note: (customer.note || '').replace(/Status: [^|]*/, 'Status: rejected ')
+      }
+    });
+
+    sendEmail(
       customer.email,
       'Your Cosmo Salon account request',
       `
@@ -354,6 +430,19 @@ app.get('/admin/approved', requireAdmin, async (req, res) => {
     res.send(approvedPage(approved));
   } catch (err) {
     res.send(approvedPage([], 'Error: ' + err.message));
+  }
+});
+
+// GET /admin/rejected — All rejected customers
+app.get('/admin/rejected', requireAdmin, async (req, res) => {
+  try {
+    const response = await shopifyAPI.get('/customers/search.json', {
+      params: { query: 'tag:rejected', limit: 100 }
+    });
+    const rejected = response.data.customers || [];
+    res.send(rejectedPage(rejected));
+  } catch (err) {
+    res.send(rejectedPage([], 'Error: ' + err.message));
   }
 });
 
@@ -404,7 +493,11 @@ h2{font-family:'Playfair Display',serif;font-size:20px;font-weight:400;margin-bo
       <label>Email Address *</label>
       <input type="email" name="email" placeholder="you@example.com" value="${email}" required autofocus>
     </div>
-    <button type="submit" class="btn">Check Account & Continue →</button>
+    <div class="field">
+      <label>Password *</label>
+      <input type="password" name="password" placeholder="Your password" required>
+    </div>
+    <button type="submit" class="btn">Sign In →</button>
   </form>
   <hr class="divider">
   <div class="links">
@@ -492,7 +585,7 @@ h2{font-family:'Playfair Display',serif;font-size:20px;font-weight:400;margin-bo
     </div>
     <button type="submit" class="btn">Create Account</button>
   </form>
-  <p class="signin-link">Already have an account? <a href="https://${process.env.SHOPIFY_STORE_DOMAIN || 'cr4kft-gq.myshopify.com'}/account/login">Sign in</a></p>
+  <p class="signin-link">Already have an account? <a href="/login">Sign in</a></p>
 </div>
 </body>
 </html>`;
@@ -513,6 +606,7 @@ body{font-family:'DM Sans',sans-serif;background:#FBF8F5;min-height:100vh;displa
 .icon{width:64px;height:64px;background:#f0faf4;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 20px;font-size:28px}
 h2{font-family:'Playfair Display',serif;font-size:22px;font-weight:400;margin-bottom:10px;color:#1A1015}
 p{font-size:13.5px;color:#5C4B56;line-height:1.75;margin-bottom:8px}
+.btn{display:inline-block;margin-top:16px;background:#1C0B1A;color:#fff;padding:11px 26px;border-radius:8px;text-decoration:none;font-size:14px}
 </style>
 </head>
 <body>
@@ -521,6 +615,7 @@ p{font-size:13.5px;color:#5C4B56;line-height:1.75;margin-bottom:8px}
   <h2>Registration Submitted!</h2>
   <p>Thank you, <b>${name}</b>!</p>
   <p>Your account request has been received. Our admin team will review and approve your account. You'll receive an email once access is granted.</p>
+  <a href="/login" class="btn">Go to Sign In</a>
 </div>
 </body>
 </html>`;
@@ -610,6 +705,7 @@ tr:hover td{background:#fafafa}
 <div class="nav">
   <a href="/admin" class="active">⏳ Pending <span class="badge">${customers.length}</span></a>
   <a href="/admin/approved">✅ Approved</a>
+  <a href="/admin/rejected">✗ Rejected</a>
 </div>
 <div class="body">
   <h2>Pending Approvals</h2>
@@ -632,11 +728,11 @@ async function approve(id, btn) {
   else { alert('Error: ' + d.error); btn.disabled = false; btn.textContent = '✓ Approve'; }
 }
 async function reject(id, btn) {
-  if (!confirm('Reject and delete this customer?')) return;
+  if (!confirm('Reject this customer? (They will move to the Rejected list.)')) return;
   btn.disabled = true; btn.textContent = '...';
   const r = await fetch('/admin/reject/' + id, {method:'POST'});
   const d = await r.json();
-  if (d.success) { btn.closest('tr').remove(); alert('Customer rejected and removed.'); }
+  if (d.success) { btn.closest('tr').remove(); alert('Customer moved to Rejected list.'); }
   else { alert('Error: ' + d.error); btn.disabled = false; btn.textContent = '✗ Reject'; }
 }
 </script>
@@ -688,6 +784,7 @@ tr:last-child td{border-bottom:none}
 <div class="nav">
   <a href="/admin">⏳ Pending</a>
   <a href="/admin/approved" class="active">✅ Approved (${customers.length})</a>
+  <a href="/admin/rejected">✗ Rejected</a>
 </div>
 <div class="body">
   <h2>Approved Customers</h2>
@@ -698,6 +795,80 @@ tr:last-child td{border-bottom:none}
     <tbody>${rows}</tbody>
   </table>`}
 </div>
+</body>
+</html>`;
+}
+
+function rejectedPage(customers, error = '') {
+  const rows = customers.map(c => {
+    const note = c.note || '';
+    const branch = note.match(/Branch: ([^|]+)/)?.[1]?.trim() || 'N/A';
+    const whatsapp = note.match(/WhatsApp: ([^|]+)/)?.[1]?.trim() || 'N/A';
+    return `<tr>
+      <td>${c.first_name}</td>
+      <td>${c.email}</td>
+      <td>${c.phone || 'N/A'}</td>
+      <td>${whatsapp}</td>
+      <td><b>${branch}</b></td>
+      <td>${new Date(c.created_at).toLocaleDateString('en-PK')}</td>
+      <td>
+        <button onclick="reapprove(${c.id}, this)" style="background:#16a34a;color:#fff;border:none;padding:6px 14px;border-radius:6px;cursor:pointer">✓ Approve</button>
+      </td>
+    </tr>`;
+  }).join('');
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Rejected — Cosmo Salon</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:sans-serif;background:#f5f5f5}
+.header{background:#1C0B1A;color:#fff;padding:16px 28px;display:flex;justify-content:space-between;align-items:center}
+.header h1{font-size:18px}
+.header a{color:#C9A96E;text-decoration:none;font-size:13px}
+.nav{background:#2E1229;padding:10px 28px;display:flex;gap:16px}
+.nav a{color:rgba(255,255,255,.7);text-decoration:none;font-size:13px;padding:6px 12px;border-radius:6px}
+.nav a.active,.nav a:hover{background:rgba(255,255,255,.1);color:#fff}
+.body{padding:24px 28px}
+h2{font-size:18px;margin-bottom:16px;color:#1C0B1A}
+table{width:100%;background:#fff;border-radius:10px;border-collapse:collapse;box-shadow:0 1px 8px rgba(0,0,0,.06)}
+th{background:#dc2626;color:#fff;padding:11px 14px;text-align:left;font-size:12px}
+td{padding:11px 14px;border-bottom:1px solid #f0f0f0;font-size:13px;color:#333;vertical-align:middle}
+tr:last-child td{border-bottom:none}
+.empty{text-align:center;padding:40px;color:#888;font-size:14px}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>🌸 Cosmo Salon — Admin Panel</h1>
+  <a href="/admin/logout">Sign out</a>
+</div>
+<div class="nav">
+  <a href="/admin">⏳ Pending</a>
+  <a href="/admin/approved">✅ Approved</a>
+  <a href="/admin/rejected" class="active">✗ Rejected (${customers.length})</a>
+</div>
+<div class="body">
+  <h2>Rejected Requests</h2>
+  ${error ? `<p style="color:red;margin-bottom:16px">${error}</p>` : ''}
+  ${customers.length === 0 ? '<p class="empty">No rejected requests.</p>' : `
+  <table>
+    <thead><tr><th>Name</th><th>Email</th><th>Phone</th><th>WhatsApp</th><th>Branch</th><th>Date</th><th>Action</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`}
+</div>
+<script>
+async function reapprove(id, btn) {
+  if (!confirm('Approve this rejected customer?')) return;
+  btn.disabled = true; btn.textContent = '...';
+  const r = await fetch('/admin/approve/' + id, {method:'POST'});
+  const d = await r.json();
+  if (d.success) { btn.closest('tr').remove(); alert('✅ Customer approved! Email sent.'); }
+  else { alert('Error: ' + d.error); btn.disabled = false; btn.textContent = '✓ Approve'; }
+}
+</script>
 </body>
 </html>`;
 }
