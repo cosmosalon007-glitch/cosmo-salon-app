@@ -128,6 +128,50 @@ function requireAdmin(req, res, next) {
 //  CUSTOMER ROUTES
 // ════════════════════════════════════════
 
+// ════════════════════════════════════════
+//  CUSTOMER LOGIN ROUTES
+// ════════════════════════════════════════
+
+// GET /login — Customer Login Form
+app.get('/login', (req, res) => {
+  res.send(loginPage());
+});
+
+// POST /login — Check approved tag then redirect to Shopify
+app.post('/login', async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.send(loginPage('Please enter your email address.'));
+
+  try {
+    // Search customer by email in Shopify
+    const response = await shopifyAPI.get('/customers/search.json', {
+      params: { query: `email:${email}`, limit: 1 }
+    });
+    const customers = response.data.customers || [];
+
+    if (customers.length === 0) {
+      return res.send(loginPage('No account found with this email. Please register first.', email));
+    }
+
+    const customer = customers[0];
+    const tags = (customer.tags || '').split(',').map(t => t.trim());
+
+    if (tags.includes('pending_approval')) {
+      return res.send(loginPage('⏳ Your account is pending admin approval. You will receive an email once approved.', email));
+    }
+
+    if (!tags.includes('approved')) {
+      return res.send(loginPage('Your account is not approved yet. Please contact Cosmo Salon.', email));
+    }
+
+    // Customer is approved! Redirect to Shopify login
+    res.redirect(`https://${process.env.SHOPIFY_STORE_DOMAIN}/account/login`);
+
+  } catch (err) {
+    res.send(loginPage('Something went wrong. Please try again.', email));
+  }
+});
+
 // GET /register — Registration Form
 app.get('/register', (req, res) => {
   res.send(registerPage());
@@ -316,6 +360,60 @@ app.get('/admin/approved', requireAdmin, async (req, res) => {
 // ════════════════════════════════════════
 //  HTML TEMPLATES
 // ════════════════════════════════════════
+
+function loginPage(error = '', email = '') {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sign In — Cosmo Salon Store</title>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;600&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--plum:#1C0B1A;--gold:#C9A96E;--cream:#FBF8F5;--border:#E8DDE6;--error:#B83A4A;--text:#1A1015;--muted:#5C4B56}
+body{font-family:'DM Sans',sans-serif;background:var(--cream);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
+.card{background:#fff;border-radius:16px;box-shadow:0 4px 40px rgba(28,11,26,.1);width:100%;max-width:420px;padding:40px 36px}
+.logo{text-align:center;margin-bottom:28px}
+.logo h1{font-family:'Playfair Display',serif;font-size:22px;color:var(--plum)}
+.logo p{font-size:12px;letter-spacing:3px;text-transform:uppercase;color:var(--gold);margin-top:4px}
+h2{font-family:'Playfair Display',serif;font-size:20px;font-weight:400;margin-bottom:20px;color:var(--text)}
+.error-box{background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;padding:12px 14px;margin-bottom:20px;font-size:13px;color:var(--error);line-height:1.6}
+.pending-box{background:#fef9f0;border:1px solid #dfc98a;border-radius:8px;padding:12px 14px;margin-bottom:20px;font-size:13px;color:#7a6040;line-height:1.6}
+.field{margin-bottom:16px}
+.field label{display:block;font-size:12px;font-weight:500;color:var(--muted);margin-bottom:5px}
+.field input{width:100%;height:44px;padding:0 13px;border:1.5px solid var(--border);border-radius:8px;font-family:'DM Sans',sans-serif;font-size:14px;color:var(--text);background:#fff;outline:none;transition:border-color .18s}
+.field input:focus{border-color:var(--gold)}
+.btn{width:100%;height:46px;background:var(--plum);color:#fff;border:none;border-radius:8px;font-family:'DM Sans',sans-serif;font-size:15px;font-weight:500;cursor:pointer;margin-top:4px;transition:opacity .18s}
+.btn:hover{opacity:.85}
+.links{text-align:center;margin-top:18px;font-size:13px;color:var(--muted)}
+.links a{color:var(--plum);font-weight:500;text-decoration:none}
+.divider{border:none;border-top:1px solid var(--border);margin:20px 0}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">
+    <h1>Cosmo Salon Store</h1>
+    <p>Partner Portal</p>
+  </div>
+  <h2>Sign In to Your Account</h2>
+  ${error && error.includes('pending') ? `<div class="pending-box">${error}</div>` : error ? `<div class="error-box">⚠️ ${error}</div>` : ''}
+  <form method="POST" action="/login">
+    <div class="field">
+      <label>Email Address *</label>
+      <input type="email" name="email" placeholder="you@example.com" value="${email}" required autofocus>
+    </div>
+    <button type="submit" class="btn">Check Account & Continue →</button>
+  </form>
+  <hr class="divider">
+  <div class="links">
+    Don't have an account? <a href="/register">Register here</a>
+  </div>
+</div>
+</body>
+</html>`;
+}
 
 function registerPage(error = '') {
   return `<!DOCTYPE html>
