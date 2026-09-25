@@ -420,6 +420,32 @@ app.post('/admin/reject/:id', requireAdmin, async (req, res) => {
   }
 });
 
+// POST /admin/reset-password/:id — Admin sets a new password for a customer
+app.post('/admin/reset-password/:id', requireAdmin, async (req, res) => {
+  const id = req.params.id;
+  const { password } = req.body;
+  if (!password || password.length < 5) {
+    return res.json({ success: false, error: 'Password must be at least 5 characters.' });
+  }
+  try {
+    const getRes = await shopifyAPI.get(`/customers/${id}.json`);
+    const customer = getRes.data.customer;
+    const newHash = hashPassword(password);
+    let note = customer.note || '';
+    if (note.match(/PWD:\s*[^\s|]+/)) {
+      note = note.replace(/PWD:\s*[^\s|]+/, 'PWD: ' + newHash);
+    } else {
+      note = note + ' | PWD: ' + newHash;
+    }
+    await shopifyAPI.put(`/customers/${id}.json`, {
+      customer: { id: id, note: note }
+    });
+    res.json({ success: true });
+  } catch (err) {
+    res.json({ success: false, error: err.message });
+  }
+});
+
 // GET /admin/approved — All approved customers
 app.get('/admin/approved', requireAdmin, async (req, res) => {
   try {
@@ -750,6 +776,7 @@ function approvedPage(customers, error = '') {
       <td>${c.phone || 'N/A'}</td>
       <td><b>${branch}</b></td>
       <td>${new Date(c.created_at).toLocaleDateString('en-PK')}</td>
+      <td><button onclick="resetPwd(${c.id}, this)" style="background:#C9A96E;color:#1C0B1A;border:none;padding:6px 14px;border-radius:6px;cursor:pointer;font-weight:600">🔑 Reset Password</button></td>
     </tr>`;
   }).join('');
 
@@ -791,10 +818,25 @@ tr:last-child td{border-bottom:none}
   ${error ? `<p style="color:red;margin-bottom:16px">${error}</p>` : ''}
   ${customers.length === 0 ? '<p class="empty">No approved customers yet.</p>' : `
   <table>
-    <thead><tr><th>Name</th><th>Email</th><th>Phone</th><th>Branch</th><th>Registered</th></tr></thead>
+    <thead><tr><th>Name</th><th>Email</th><th>Phone</th><th>Branch</th><th>Registered</th><th>Action</th></tr></thead>
     <tbody>${rows}</tbody>
   </table>`}
 </div>
+<script>
+async function resetPwd(id, btn) {
+  var np = prompt('Enter NEW password for this customer (min 5 characters):');
+  if (np === null) return;
+  if (np.length < 5) { alert('Password must be at least 5 characters.'); return; }
+  btn.disabled = true; var old = btn.textContent; btn.textContent = '...';
+  const r = await fetch('/admin/reset-password/' + id, {
+    method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({password: np})
+  });
+  const d = await r.json();
+  if (d.success) { alert('✅ Password updated!\\nNew password: ' + np + '\\nTell this to the customer.'); }
+  else { alert('Error: ' + (d.error||'failed')); }
+  btn.disabled = false; btn.textContent = old;
+}
+</script>
 </body>
 </html>`;
 }
