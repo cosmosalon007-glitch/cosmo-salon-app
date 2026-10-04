@@ -81,7 +81,7 @@ app.get('/install', (req, res) => {
   const shop = process.env.SHOPIFY_STORE_DOMAIN || req.query.shop;
   if (!shop) return res.send('Missing shop parameter');
   const apiKey = process.env.SHOPIFY_API_KEY;
-  const scopes = 'read_customers,write_customers';
+  const scopes = 'read_customers,write_customers,read_orders,read_products';
   const redirectUri = `${process.env.APP_URL}/auth/callback`;
   const state = crypto.randomBytes(16).toString('hex');
   req.session.oauthState = state;
@@ -744,6 +744,7 @@ tr:hover td{background:#fafafa}
   <a href="/admin" class="active">⏳ Pending <span class="badge">${customers.length}</span></a>
   <a href="/admin/approved">✅ Approved</a>
   <a href="/admin/rejected">✗ Rejected</a>
+  <a href="/admin/po">📦 Branch Orders &amp; PO</a>
 </div>
 <div class="body">
   <h2>Pending Approvals</h2>
@@ -824,6 +825,7 @@ tr:last-child td{border-bottom:none}
   <a href="/admin">⏳ Pending</a>
   <a href="/admin/approved" class="active">✅ Approved (${customers.length})</a>
   <a href="/admin/rejected">✗ Rejected</a>
+  <a href="/admin/po">📦 Branch Orders &amp; PO</a>
 </div>
 <div class="body">
   <h2>Approved Customers</h2>
@@ -903,6 +905,7 @@ tr:last-child td{border-bottom:none}
   <a href="/admin">⏳ Pending</a>
   <a href="/admin/approved">✅ Approved</a>
   <a href="/admin/rejected" class="active">✗ Rejected (${customers.length})</a>
+  <a href="/admin/po">📦 Branch Orders &amp; PO</a>
 </div>
 <div class="body">
   <h2>Rejected Requests</h2>
@@ -925,6 +928,264 @@ async function reapprove(id, btn) {
 </script>
 </body>
 </html>`;
+}
+
+// ════════════════════════════════════════
+//  BRANCH ORDERS & PURCHASE ORDERS (PO)
+// ════════════════════════════════════════
+const BRANCHES = ['MM Alam — Women','MM Alam — Men','DHA — Women','DHA — Men','PIA — Women','PIA — Men','Iqbal Town — Women'];
+
+function parseNoteBranch(note){ const m=(note||'').match(/Branch:\s*([^|]+)/); return m ? m[1].trim() : ''; }
+function pkDate(dt){ return new Date(dt.getTime()+5*3600000).toISOString().slice(0,10); }
+function fmtDateTime(iso){
+  try{
+    const d=new Date(iso);
+    return {
+      date:d.toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric',timeZone:'Asia/Karachi'}),
+      time:d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',timeZone:'Asia/Karachi'})
+    };
+  }catch(e){ return {date:String(iso).slice(0,10),time:''}; }
+}
+function money(n){ return (Math.round(Number(n)||0)).toLocaleString('en-PK'); }
+function esc(s){ return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+async function customerBranchMap(){
+  const map={};
+  for(const q of ['tag:approved','tag:pending_approval','tag:rejected']){
+    try{
+      const r=await shopifyAPI.get('/customers/search.json',{params:{query:q,limit:250}});
+      (r.data.customers||[]).forEach(c=>{
+        map[c.id]={branch:parseNoteBranch(c.note),name:`${c.first_name||''} ${(c.last_name&&c.last_name!=='.')?c.last_name:''}`.trim(),phone:c.phone||'',email:c.email||''};
+      });
+    }catch(e){}
+  }
+  return map;
+}
+
+async function getBranchOrders(branch, from, to){
+  const map=await customerBranchMap();
+  const minISO=`${from}T00:00:00+05:00`, maxISO=`${to}T23:59:59+05:00`;
+  const r=await shopifyAPI.get('/orders.json',{params:{status:'any',created_at_min:minISO,created_at_max:maxISO,limit:250}});
+  return (r.data.orders||[]).map(o=>{
+    const cb=(o.customer&&map[o.customer.id])?map[o.customer.id]:null;
+    return Object.assign({},o,{_branch:cb?cb.branch:'',_cust:cb});
+  }).filter(o=>o._branch===branch);
+}
+
+function presets(branch){
+  const now=new Date(), today=pkDate(now);
+  const minus=(d)=>pkDate(new Date(now.getTime()-d*86400000));
+  return [
+    {label:'Today',from:today,to:today},
+    {label:'Yesterday',from:minus(1),to:minus(1)},
+    {label:'This week',from:minus(6),to:today},
+    {label:'This month',from:minus(29),to:today},
+    {label:'All time',from:'2020-01-01',to:today}
+  ].map(p=>Object.assign(p,{url:`/admin/po?branch=${encodeURIComponent(branch)}&from=${p.from}&to=${p.to}`}));
+}
+
+// GET /admin/po — Branch Orders & PO portal
+app.get('/admin/po', requireAdmin, async (req,res)=>{
+  const branch=req.query.branch||BRANCHES[0];
+  const today=pkDate(new Date());
+  const from=req.query.from||today, to=req.query.to||today;
+  try{
+    const orders=await getBranchOrders(branch,from,to);
+    res.send(poPortalPage(branch,from,to,orders));
+  }catch(err){
+    const msg=(err.response&&err.response.data&&err.response.data.errors)?JSON.stringify(err.response.data.errors):err.message;
+    res.send(poPortalPage(branch,from,to,[],msg));
+  }
+});
+
+// GET /admin/po/doc — Printable Purchase Order
+app.get('/admin/po/doc', requireAdmin, async (req,res)=>{
+  const branch=req.query.branch||BRANCHES[0];
+  const today=pkDate(new Date());
+  const from=req.query.from||today, to=req.query.to||today;
+  try{
+    const orders=await getBranchOrders(branch,from,to);
+    res.send(poDocPage(branch,from,to,orders,req.query.auto));
+  }catch(err){ res.send('Error: '+esc(err.message)); }
+});
+
+function poPortalPage(branch, from, to, orders, error=''){
+  const ps=presets(branch);
+  const rows=orders.map(o=>{
+    const t=fmtDateTime(o.created_at);
+    const items=o.line_items||[];
+    const qty=items.reduce((s,li)=>s+(li.quantity||0),0);
+    const first=items.length?esc(items[0].title):'—';
+    const more=items.length>1?` <small>+ ${items.length-1} more</small>`:'';
+    const amt=items.reduce((s,li)=>s+(Number(li.price)||0)*(li.quantity||0),0);
+    return `<tr><td class="ono">${esc(o.name)}</td><td>${t.date}</td><td><span class="time">${t.time}</span></td><td class="items">${first}${more}</td><td class="qty">${qty}</td><td class="amt">${money(amt)}</td></tr>`;
+  }).join('');
+  const totalItems=orders.reduce((s,o)=>s+(o.line_items||[]).reduce((a,li)=>a+(li.quantity||0),0),0);
+  const grand=orders.reduce((s,o)=>s+(o.line_items||[]).reduce((a,li)=>a+(Number(li.price)||0)*(li.quantity||0),0),0);
+  const opts=BRANCHES.map(b=>`<option ${b===branch?'selected':''}>${b}</option>`).join('');
+  const chips=ps.map(p=>`<a href="${p.url}" class="chip ${(p.from===from&&p.to===to)?'on':''}">${p.label}</a>`).join('');
+  const docBase=`/admin/po/doc?branch=${encodeURIComponent(branch)}&from=${from}&to=${to}`;
+  return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Branch Orders &amp; PO</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:sans-serif;background:#f5f5f5;min-height:100vh}
+.header{background:#1C0B1A;color:#fff;padding:16px 28px;display:flex;justify-content:space-between;align-items:center}
+.header h1{font-size:18px}.header a{color:#C9A96E;text-decoration:none;font-size:13px}
+.nav{background:#2E1229;padding:10px 28px;display:flex;gap:14px;flex-wrap:wrap}
+.nav a{color:rgba(255,255,255,.7);text-decoration:none;font-size:13px;padding:6px 12px;border-radius:6px}
+.nav a.active,.nav a:hover{background:rgba(255,255,255,.1);color:#fff}
+.body{padding:24px 28px}
+h2{font-size:20px;margin-bottom:4px;color:#1C0B1A}
+.lead{font-size:13px;color:#8a7279;margin-bottom:18px}
+.filters{background:#fff;border:1px solid #eee;border-radius:12px;padding:16px 18px;margin-bottom:18px}
+.frow{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap}
+.fg{display:flex;flex-direction:column;gap:5px}
+.fg label{font-size:11px;color:#8a7279;font-weight:700}
+.fg select,.fg input{height:40px;border:1.5px solid #E8DDE6;border-radius:8px;padding:0 11px;font-size:14px;min-width:170px;font-family:inherit}
+.apply{height:40px;padding:0 20px;background:#1C0B1A;color:#fff;border:none;border-radius:8px;font-size:14px;cursor:pointer;font-weight:600}
+.presets{display:flex;gap:7px;margin:14px 0 2px;flex-wrap:wrap}
+.chip{padding:7px 13px;border-radius:999px;border:1px solid #E8DDE6;font-size:12.5px;color:#8a7279;text-decoration:none}
+.chip.on{background:#1C0B1A;color:#fff;border-color:#1C0B1A;font-weight:700}
+.btns{display:flex;gap:10px;margin-top:14px}
+.pr{height:42px;padding:0 18px;background:#fff;color:#1C0B1A;border:1.5px solid #1C0B1A;border-radius:8px;font-size:14px;font-weight:700;text-decoration:none;display:inline-flex;align-items:center;gap:8px}
+.dl{height:42px;padding:0 18px;background:#1C0B1A;color:#fff;border-radius:8px;font-size:14px;font-weight:700;text-decoration:none;display:inline-flex;align-items:center;gap:8px}
+table{width:100%;background:#fff;border-radius:12px 12px 0 0;border-collapse:collapse;overflow:hidden;box-shadow:0 1px 8px rgba(0,0,0,.06)}
+th{background:#1C0B1A;color:#fff;padding:11px 14px;text-align:left;font-size:11.5px}
+th.c,td.c{text-align:center}th.r,td.r{text-align:right}
+td{padding:12px 14px;border-bottom:1px solid #f0f0f0;font-size:13px;vertical-align:top}
+tr:last-child td{border-bottom:none}
+.ono{font-weight:700;color:#7a1f3d}
+.time{background:#FBF4F6;color:#7a1f3d;border-radius:6px;padding:3px 8px;font-size:11.5px;font-weight:700}
+.items small{color:#999}
+.qty{text-align:center;font-weight:700}.amt{text-align:right;font-weight:700}
+.foot{display:flex;gap:28px;padding:14px 18px;background:#FBF4F6;font-size:13px;border-radius:0 0 12px 12px}
+.foot .g{margin-left:auto;font-weight:700;color:#7a1f3d;font-size:15px}
+.empty{background:#fff;border-radius:12px;padding:40px;text-align:center;color:#999;box-shadow:0 1px 8px rgba(0,0,0,.06)}
+.err{background:#fef2f2;border:1px solid #fca5a5;color:#b83a4a;padding:12px;border-radius:8px;margin-bottom:14px;font-size:13px}
+</style></head><body>
+<div class="header"><h1>🌸 Cosmo Salon — Admin Panel</h1><a href="/admin/logout">Sign out</a></div>
+<div class="nav"><a href="/admin">⏳ Pending</a><a href="/admin/approved">✅ Approved</a><a href="/admin/rejected">✗ Rejected</a><a href="/admin/po" class="active">📦 Branch Orders &amp; PO</a></div>
+<div class="body">
+<h2>Branch Orders &amp; PO</h2>
+<p class="lead">Select a branch and date range to view orders and generate a Purchase Order.</p>
+${error?`<div class="err">⚠️ ${esc(error)}</div>`:''}
+<div class="filters">
+  <form method="GET" action="/admin/po"><div class="frow">
+    <div class="fg"><label>BRANCH</label><select name="branch">${opts}</select></div>
+    <div class="fg"><label>FROM</label><input type="date" name="from" value="${from}"></div>
+    <div class="fg"><label>TO</label><input type="date" name="to" value="${to}"></div>
+    <button class="apply" type="submit">Apply</button>
+  </div></form>
+  <div class="presets">${chips}</div>
+  <div class="btns"><a class="pr" href="${docBase}&auto=print" target="_blank">🖨 Print PO</a><a class="dl" href="${docBase}" target="_blank">📥 Download PO (PDF)</a></div>
+</div>
+${orders.length===0?`<div class="empty">No orders for <b>${esc(branch)}</b> in the selected dates.</div>`:`
+<table><thead><tr><th>ORDER</th><th>DATE</th><th>TIME</th><th>PRODUCTS</th><th class="c">QTY</th><th class="r">AMOUNT (PKR)</th></tr></thead><tbody>${rows}</tbody></table>
+<div class="foot"><span>Total orders: <b>${orders.length}</b></span><span>Total items: <b>${totalItems}</b></span><span class="g">Grand Total: Rs ${money(grand)}</span></div>`}
+</div></body></html>`;
+}
+
+function poDocPage(branch, from, to, orders, auto){
+  const pm={};
+  orders.forEach(o=>{ (o.line_items||[]).forEach(li=>{
+    const k=li.title||'Item';
+    if(!pm[k]) pm[k]={title:k,qty:0,amount:0,price:Number(li.price)||0,refs:new Set()};
+    pm[k].qty+=li.quantity||0; pm[k].amount+=(Number(li.price)||0)*(li.quantity||0); pm[k].refs.add(o.name);
+  });});
+  const items=Object.values(pm);
+  const subtotal=items.reduce((s,i)=>s+i.amount,0);
+  const totalUnits=items.reduce((s,i)=>s+i.qty,0);
+  const cust=(orders[0]&&orders[0]._cust)||{name:'',phone:'',email:''};
+  const sa=(orders[0]&&orders[0].shipping_address)||{};
+  const address=[sa.address1,sa.city].filter(Boolean).join(', ')||'—';
+  const phone=cust.phone||sa.phone||'—';
+  const email=cust.email||(orders[0]&&orders[0].email)||'—';
+  const orderer=cust.name||(sa.name)||'—';
+  const poNo='CC-'+from.replace(/-/g,'')+(orders[0]?('-'+orders[0].order_number):'');
+  const rangeLabel = from===to ? from : (from+' → '+to);
+  const times=orders.map(o=>fmtDateTime(o.created_at).time).join(', ');
+  const rows=items.map((it,i)=>`<tr><td>${i+1}</td><td>${esc(it.title)} <span class="sub">· ${Array.from(it.refs).join(', ')}</span></td><td class="c">${it.qty}</td><td class="r">${money(it.price)}</td><td class="r">${money(it.amount)}</td></tr>`).join('');
+  const autoPrint = auto==='print' ? `<script>window.addEventListener('load',function(){setTimeout(function(){window.print();},350);});</script>` : '';
+  const backUrl=`/admin/po?branch=${encodeURIComponent(branch)}&from=${from}&to=${to}`;
+  const body = orders.length===0 ? `<div style="padding:60px;text-align:center;color:#999">No orders for ${esc(branch)} in ${rangeLabel}.</div>` : `
+  <div class="hd">
+    <div class="em"><div class="c">&#10047;</div><div><h1>Cosmo Salon Store</h1><p>PURCHASE ORDER</p><div class="co">Head Office · Lahore, Pakistan</div></div></div>
+    <div class="po-meta"><div class="t">PO #${esc(poNo)}</div><div class="r"><b>Date:</b> ${pkDate(new Date())}<br><b>Period:</b> ${rangeLabel}<br><b>Status:</b> Pending dispatch</div></div>
+  </div>
+  <div class="two">
+    <div class="box"><div class="lbl">ORDERED BY (BRANCH)</div><div class="v">
+      <b>${esc(orderer)}</b><br>
+      <div class="rw"><span class="k">Branch:</span><span>${esc(branch)}</span></div>
+      <div class="rw"><span class="k">Phone:</span><span>${esc(phone)}</span></div>
+      <div class="rw"><span class="k">Email:</span><span>${esc(email)}</span></div>
+      <div class="rw"><span class="k">Address:</span><span>${esc(address)}</span></div>
+    </div></div>
+    <div class="box r"><div class="lbl">ORDER SUMMARY</div><div class="v">
+      <div class="rw"><span class="k">Orders:</span><span><b>${orders.length}</b> (${orders.map(o=>esc(o.name)).join(', ')})</span></div>
+      <div class="rw"><span class="k">Times:</span><span>${times}</span></div>
+      <div class="rw"><span class="k">Items:</span><span>${totalUnits} units · ${items.length} products</span></div>
+      <div class="rw"><span class="k">Amount:</span><span><b>Rs ${money(subtotal)}</b></span></div>
+    </div></div>
+  </div>
+  <table>
+    <thead><tr><th>#</th><th>PRODUCT</th><th class="c">QTY</th><th class="r">RATE</th><th class="r">AMOUNT (PKR)</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>
+  <div class="tot">
+    <div class="rw2"><span>Subtotal</span><span>Rs ${money(subtotal)}</span></div>
+    <div class="rw2"><span>GST (0%)</span><span>Rs 0</span></div>
+    <div class="rw2 grand"><span>Grand Total</span><span>Rs ${money(subtotal)}</span></div>
+  </div>
+  <div class="signs">
+    <div class="sg"><div class="l"><b>Authorized by</b>Cosmo Salon — Head Office</div></div>
+    <div class="sg"><div class="l"><b>Received by</b>${esc(branch)} (Branch)</div></div>
+  </div>
+  <div class="ftn">Generated by Cosmo Salon Portal · ${pkDate(new Date())} · ${orders.length} orders · ${totalUnits} items</div>`;
+  return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PO ${esc(poNo)}</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:sans-serif;background:#EDE7E2;color:#241A1E}
+.toolbar{position:sticky;top:0;background:#1C0B1A;color:#fff;padding:12px 20px;display:flex;gap:12px;align-items:center;justify-content:space-between;z-index:10}
+.toolbar .tt{font-size:14px}
+.toolbar button{background:#C9A96E;color:#241A1E;border:none;border-radius:7px;padding:10px 18px;font-size:13px;font-weight:700;cursor:pointer}
+.toolbar a{color:#fff;border:1px solid rgba(255,255,255,.4);border-radius:7px;padding:9px 16px;font-size:13px;text-decoration:none}
+.wrap{display:flex;justify-content:center;padding:28px}
+.page{width:800px;max-width:100%;background:#fff;box-shadow:0 20px 60px -30px rgba(0,0,0,.4);padding:42px 46px}
+.hd{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:3px solid #1C0B1A;padding-bottom:20px}
+.em{display:flex;align-items:center;gap:13px}
+.em .c{width:52px;height:52px;border-radius:50%;background:#1C0B1A;color:#C9A96E;font-size:24px;display:flex;align-items:center;justify-content:center}
+.em h1{font-size:23px;font-weight:700}
+.em p{font-size:11px;letter-spacing:2px;color:#7a1f3d;margin-top:3px;font-weight:700}
+.em .co{font-size:11px;color:#8a7179;margin-top:4px}
+.po-meta{text-align:right}.po-meta .t{font-size:22px;color:#7a1f3d;font-weight:700}
+.po-meta .r{font-size:12px;color:#8a7179;margin-top:7px;line-height:1.7}.po-meta b{color:#241A1E}
+.two{display:flex;gap:24px;margin:22px 0 18px}
+.box{flex:1;background:#FBF4F6;border-radius:9px;padding:15px 17px}.box.r{background:#fff;border:1px solid #E7DDD6}
+.box .lbl{font-size:10px;letter-spacing:.6px;color:#7a1f3d;font-weight:700;margin-bottom:8px}
+.box .v{font-size:12.8px;line-height:1.85}.box .v b{font-size:14.5px}
+.box .v .rw{display:flex;gap:6px}.box .v .k{color:#8a7179;min-width:62px}
+table{width:100%;border-collapse:collapse;margin-top:4px}
+th{background:#1C0B1A;color:#fff;font-size:11px;padding:11px 13px;text-align:left}
+th.c,td.c{text-align:center}th.r,td.r{text-align:right}
+td{padding:11px 13px;border-bottom:1px solid #EFE7E1;font-size:12.8px}
+tbody tr:nth-child(even){background:#FBF4F6}
+.sub{color:#999;font-size:11px}
+.tot{margin-top:16px;margin-left:auto;width:270px}
+.tot .rw2{display:flex;justify-content:space-between;padding:6px 0;font-size:13px}
+.tot .grand{border-top:2px solid #1C0B1A;margin-top:6px;padding-top:10px;font-size:17px;font-weight:700;color:#7a1f3d}
+.signs{display:flex;justify-content:space-between;margin-top:46px;gap:40px}
+.sg{flex:1;text-align:center}
+.sg .l{border-top:1px solid #B9A9AE;padding-top:7px;font-size:11.5px;color:#8a7179}
+.sg .l b{display:block;color:#241A1E;font-size:12.5px;margin-bottom:1px}
+.ftn{margin-top:26px;border-top:1px solid #E7DDD6;padding-top:13px;font-size:11px;color:#8a7179}
+@media print{.toolbar{display:none}body{background:#fff}.wrap{padding:0}.page{box-shadow:none;width:auto;padding:10px 6px}}
+</style></head><body>
+<div class="toolbar"><span class="tt">PO ${esc(poNo)} · ${esc(branch)}</span><div><a href="${backUrl}">← Back</a> &nbsp;<button onclick="window.print()">🖨 Print / Save as PDF</button></div></div>
+<div class="wrap"><div class="page">${body}</div></div>
+${autoPrint}
+</body></html>`;
 }
 
 // ── START SERVER ──
