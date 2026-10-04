@@ -186,17 +186,39 @@ app.get('/', async (req, res) => {
     }
   }
 
-  // 3) Diagnostic landing — show what Shopify sent so we know the right params
-  const qp = Object.keys(req.query);
-  const diag = qp.length
-    ? `<p style="color:#C9A96E;font-size:12px;word-break:break-all">Params received: ${qp.join(', ')}</p>`
-    : '';
+  // 3) Loaded from Shopify Admin (shop present, no token yet) →
+  //    use App Bridge to fetch a session token, then re-hit "/" with id_token for token exchange.
+  if (shop) {
+    return res.send(`<!DOCTYPE html><html><head>
+      <meta name="shopify-api-key" content="${CID}">
+      <script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
+      <title>Cosmo App — Authorizing</title>
+      <style>body{font-family:sans-serif;background:#1C0B1A;color:#fff;text-align:center;padding-top:70px;margin:0}
+      a{color:#C9A96E}.err{color:#f59e0b;max-width:620px;margin:16px auto;font-size:14px;line-height:1.7}</style>
+      </head><body>
+      <h2>🌸 Getting access token…</h2>
+      <p id="msg">Please wait…</p>
+      <script>
+        (async function(){
+          try {
+            if (!window.shopify || !shopify.idToken) throw new Error('App Bridge not loaded — open this app from inside Shopify Admin → Apps.');
+            const t = await shopify.idToken();
+            window.location.href = '/?shop=' + encodeURIComponent(${JSON.stringify(String(shop))}) + '&id_token=' + encodeURIComponent(t);
+          } catch (e) {
+            document.getElementById('msg').className = 'err';
+            document.getElementById('msg').innerText = 'App Bridge error: ' + (e && e.message ? e.message : e) + '  —  Please open this app from Shopify Admin → Apps (so it loads inside the admin).';
+          }
+        })();
+      </script>
+      </body></html>`);
+  }
+
+  // 4) Direct visit (no shop param) → plain landing
   res.send(`<!DOCTYPE html><html><head><title>Cosmo App</title>
     <style>body{font-family:sans-serif;background:#1C0B1A;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
     .b{text-align:center}a{color:#C9A96E}</style></head>
     <body><div class="b"><h2>🌸 Cosmo App is running</h2>
     <p><a href="/admin">Admin Panel</a> · <a href="/login">Customer Login</a> · <a href="/register">Register</a></p>
-    ${diag}
     </div></body></html>`);
 });
 
