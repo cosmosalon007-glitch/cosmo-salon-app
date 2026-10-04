@@ -130,44 +130,73 @@ app.get('/auth/callback', async (req, res) => {
   }
 });
 
-// GET / — Landing + OAuth code capture (for Dev Dashboard install redirect)
+// GET / — Landing + token capture (Dev Dashboard managed install / OAuth)
 app.get('/', async (req, res) => {
-  const { code, shop } = req.query;
+  const { code, shop, id_token } = req.query;
+  const CID = process.env.SHOPIFY_API_KEY;
+  const CSECRET = process.env.SHOPIFY_API_SECRET;
+
+  const tokenPage = (token) => `
+    <!DOCTYPE html><html><head><title>App Installed!</title>
+    <style>body{font-family:sans-serif;background:#0f0f0f;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+    .box{background:#1a1a1a;border:1px solid #333;border-radius:12px;padding:36px;max-width:620px;text-align:center}
+    h2{color:#22c55e;font-size:24px;margin-bottom:16px}
+    .token{background:#111;border:1px solid #444;border-radius:8px;padding:16px;font-family:monospace;font-size:13px;word-break:break-all;margin:16px 0;color:#86efac}
+    p{color:#aaa;font-size:14px;line-height:1.7}</style></head>
+    <body><div class="box">
+    <h2>✅ App Installed Successfully!</h2>
+    <p>Copy this Access Token and paste it in Railway as <b>SHOPIFY_ACCESS_TOKEN</b>:</p>
+    <div class="token">${token}</div>
+    <p>Railway → Variables → SHOPIFY_ACCESS_TOKEN = above token → Deploy</p>
+    <p style="color:#22c55e">Admin panel: <a href="/admin" style="color:#86efac">/admin</a></p>
+    </div></body></html>`;
+
+  // 1) Legacy authorization code grant
   if (code && shop) {
     try {
-      const response = await axios.post(`https://${shop}/admin/oauth/access_token`, {
-        client_id: process.env.SHOPIFY_API_KEY,
-        client_secret: process.env.SHOPIFY_API_SECRET,
-        code
-      });
-      const token = response.data.access_token;
+      const r = await axios.post(`https://${shop}/admin/oauth/access_token`, {
+        client_id: CID, client_secret: CSECRET, code });
+      const token = r.data.access_token;
       savedAccessToken = token;
       try { fs.writeFileSync(TOKEN_FILE, token); } catch (e) {}
-      return res.send(`
-        <!DOCTYPE html><html><head><title>App Installed!</title>
-        <style>body{font-family:sans-serif;background:#0f0f0f;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
-        .box{background:#1a1a1a;border:1px solid #333;border-radius:12px;padding:36px;max-width:620px;text-align:center}
-        h2{color:#22c55e;font-size:24px;margin-bottom:16px}
-        .token{background:#111;border:1px solid #444;border-radius:8px;padding:16px;font-family:monospace;font-size:13px;word-break:break-all;margin:16px 0;color:#86efac}
-        p{color:#aaa;font-size:14px;line-height:1.7}</style></head>
-        <body><div class="box">
-        <h2>✅ App Installed Successfully!</h2>
-        <p>Copy this Access Token and paste it in Railway as <b>SHOPIFY_ACCESS_TOKEN</b>:</p>
-        <div class="token">${token}</div>
-        <p>Railway → Variables → SHOPIFY_ACCESS_TOKEN = above token → Deploy</p>
-        <p style="color:#22c55e">Admin panel: <a href="/admin" style="color:#86efac">/admin</a></p>
-        </div></body></html>
-      `);
+      return res.send(tokenPage(token));
     } catch (err) {
-      const detail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
-      return res.send('OAuth token exchange error: ' + detail + ' — Please re-install from the Dev Dashboard (the code may have expired).');
+      const d = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+      return res.send('Auth code error: ' + d);
     }
   }
+
+  // 2) Token exchange (new Dev Dashboard managed install sends id_token)
+  if (id_token && shop) {
+    try {
+      const r = await axios.post(`https://${shop}/admin/oauth/access_token`, {
+        client_id: CID, client_secret: CSECRET,
+        grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange',
+        subject_token: id_token,
+        subject_token_type: 'urn:ietf:params:oauth:token-type:id_token',
+        requested_token_type: 'urn:shopify:params:oauth:token-type:offline-access-token'
+      });
+      const token = r.data.access_token;
+      savedAccessToken = token;
+      try { fs.writeFileSync(TOKEN_FILE, token); } catch (e) {}
+      return res.send(tokenPage(token));
+    } catch (err) {
+      const d = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+      return res.send('Token exchange error: ' + d);
+    }
+  }
+
+  // 3) Diagnostic landing — show what Shopify sent so we know the right params
+  const qp = Object.keys(req.query);
+  const diag = qp.length
+    ? `<p style="color:#C9A96E;font-size:12px;word-break:break-all">Params received: ${qp.join(', ')}</p>`
+    : '';
   res.send(`<!DOCTYPE html><html><head><title>Cosmo App</title>
     <style>body{font-family:sans-serif;background:#1C0B1A;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
     .b{text-align:center}a{color:#C9A96E}</style></head>
     <body><div class="b"><h2>🌸 Cosmo App is running</h2>
     <p><a href="/admin">Admin Panel</a> · <a href="/login">Customer Login</a> · <a href="/register">Register</a></p>
+    ${diag}
     </div></body></html>`);
 });
 
